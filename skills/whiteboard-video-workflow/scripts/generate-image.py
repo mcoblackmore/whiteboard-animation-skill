@@ -1,308 +1,326 @@
 #!/usr/bin/env python3
+"""
+ComfyUI 图片生成器 - 重构版本
 
-import asyncio
+通过调用本地 ComfyUI REST API 生成白板风格图片。
+
+用法:
+    python generate-image.py "<prompt>" [aspect_ratio] [output_dir]
+    python generate-image.py '["prompt1", "prompt2"]' [aspect_ratio] [output_dir]  # 批量模式
+
+前置条件:
+    1. ComfyUI 运行在 127.0.0.1:8188
+    2. 从 ComfyUI 导出白板风格工作流为 API 格式，保存到本脚本同目录的 workflow_api.json
+"""
+
 import json
 import os
 import random
 import sys
 import time
+import traceback
+import urllib.parse
+import urllib.request
+from datetime import datetime
 from pathlib import Path
-from urllib.request import urlopen, Request
-from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from banana_prompt_template import whiteboard_prompt_template
+try:
+    from banana_prompt_template import whiteboard_prompt_template
+except ImportError:
+    whiteboard_prompt_template = ""
 
-# --- Config ---
-API_BASE = 'https://www.runninghub.cn/openapi/v2'
-TEXT_TO_IMAGE_PATH = '/rhart-image-n-g31-flash/text-to-image'
-QUERY_PATH = '/query'
-RESOLUTION = '2k'
-
+COMFYUI_SERVER = "127.0.0.1:8188"
+WORKFLOW_JSON = str(Path(__file__).resolve().parent / "workflow_api.json")
+TIMEOUT_SECONDS = 300
+CHECK_INTERVAL = 1
 MAX_RETRIES = 3
-SUBMIT_MAX_RETRIES = 8
-POLL_MAX_RETRIES = 5
-
-RETRY_BASE_DELAY_S = 3.0
-POLL_INTERVAL_S = 5.0
-
-BATCH_CONCURRENCY = 10
-
-SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-# --- Load .env from skill directory ---
-def load_env():
-    if os.environ.get('RUNNINGHUB_API_KEY'):
-        return
-    env_path = SCRIPT_DIR.parent / '.env'
-    if env_path.exists():
-        for line in env_path.read_text(encoding='utf-8').splitlines():
-            trimmed = line.strip()
-            if not trimmed or trimmed.startswith('#'):
-                continue
-            eq_index = trimmed.find('=')
-            if eq_index == -1:
-                continue
-            key = trimmed[:eq_index].strip()
-            value = trimmed[eq_index + 1:].strip()
-            if key == 'RUNNINGHUB_API_KEY' and value:
-                os.environ['RUNNINGHUB_API_KEY'] = value
-                return
-
-
-# --- Error classification ---
 class RetryableError(Exception):
-    """Errors worth retrying (rate-limit, server error, network)."""
     def __init__(self, message, *, is_rate_limit=False):
         super().__init__(message)
         self.is_rate_limit = is_rate_limit
 
 
-class FatalError(Exception):
-    """Errors that should not be retried (bad request, auth, etc)."""
-    pass
+def log(message, level="INFO"):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    prefixes = {
+        "INFO": "[INFO]",
+        "OK": "[OK]",
+        "WARN": "[WARN]",
+        "ERROR": "[ERROR]",
+        "PROGRESS": "[PROGRESS]",
+    }
+    prefix = prefixes.get(level, "[INFO]")
+    print(f"{timestamp} {prefix} {message}")
+    sys.stdout.flush()
 
 
-def classify_error(e):
-    """Return (retryable, is_rate_limit) for a given exception."""
-    msg = str(e).lower()
-    if isinstance(e, FatalError):
-        return False, False
-    if 'http 429' in msg or 'rate' in msg or 'too many' in msg:
-        return True, True
-    if 'http 5' in msg:
-        return True, False
-    # Default: treat as retryable network/transient error
-    return True, False
+def check_workflow():
+    if not os.path.exists(WORKFLOW_JSON):
+        log(f"工作流文件不存在: {WORKFLOW_JSON}", "ERROR")
+        print("\n请按以下步骤导出工作流:")
+        print("  1. 在 ComfyUI 中打开白板风格工作流")
+        print("  2. 点击右上角菜单 (三个点)")
+        print("  3. 选择 'Save (API Format)' 或 '保存(API格式)'")
+        print(f"  4. 保存到: {WORKFLOW_JSON}")
+        raise FileNotFoundError(WORKFLOW_JSON)
 
 
-# --- HTTP helper (synchronous, used in thread) ---
-def request_sync(method, url_path, body):
-    api_key = os.environ.get('RUNNINGHUB_API_KEY')
-    if not api_key:
-        raise FatalError('RUNNINGHUB_API_KEY not found. Set it in environment variable or .env file.')
-
-    url = API_BASE + url_path
-    payload = json.dumps(body).encode('utf-8')
-    req = Request(url, data=payload, method=method)
-    req.add_header('Content-Type', 'application/json')
-    req.add_header('Authorization', f'Bearer {api_key}')
-
-    try:
-        with urlopen(req, timeout=30) as resp:
-            data = resp.read().decode('utf-8')
-            return json.loads(data)
-    except HTTPError as e:
-        body_text = e.read().decode('utf-8', errors='replace')
-        if e.code == 400 or e.code == 401 or e.code == 403:
-            raise FatalError(f'HTTP {e.code}: {body_text}')
-        if e.code == 429:
-            raise RetryableError(f'HTTP 429 (rate limited): {body_text}', is_rate_limit=True)
-        # 5xx and other codes are retryable
-        raise RetryableError(f'HTTP {e.code}: {body_text}')
-    except json.JSONDecodeError as e:
-        raise RetryableError(f'Failed to parse response: {e}')
-    except Exception as e:
-        raise RetryableError(str(e))
+def load_workflow():
+    check_workflow()
+    with open(WORKFLOW_JSON, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-# --- Retry wrapper with exponential backoff + jitter ---
-def calc_backoff(attempt, base=RETRY_BASE_DELAY_S, is_rate_limit=False):
-    """Exponential backoff with jitter. Rate-limit errors get 2x longer wait."""
-    multiplier = 2.0 if is_rate_limit else 1.0
-    delay = base * (2 ** (attempt - 1)) * multiplier
-    jitter = random.uniform(0.5, 1.5)
-    return delay * jitter
+def send_prompt(workflow):
+    data = json.dumps({"prompt": workflow}).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://{COMFYUI_SERVER}/prompt",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
-async def with_retry(fn, max_retries=MAX_RETRIES, context=''):
-    for attempt in range(1, max_retries + 1):
-        try:
-            return await fn()
-        except FatalError:
-            raise
-        except RetryableError as e:
-            if attempt == max_retries:
-                raise
-            delay = calc_backoff(attempt, is_rate_limit=e.is_rate_limit)
-            print(f'{context}Attempt {attempt}/{max_retries} failed: {e}. Retrying in {delay:.1f}s...')
-            await asyncio.sleep(delay)
-        except Exception as e:
-            retryable, is_rate_limit = classify_error(e)
-            if not retryable or attempt == max_retries:
-                raise
-            delay = calc_backoff(attempt, is_rate_limit=is_rate_limit)
-            print(f'{context}Attempt {attempt}/{max_retries} failed: {e}. Retrying in {delay:.1f}s...')
-            await asyncio.sleep(delay)
-
-
-# --- Step 1: Submit text-to-image task ---
-def _submit_task_sync(prompt, aspect_ratio):
-    res = request_sync('POST', TEXT_TO_IMAGE_PATH, {
-        'prompt': prompt,
-        'aspectRatio': aspect_ratio,
-        'resolution': RESOLUTION,
-    })
-    if not res.get('taskId'):
-        raise RetryableError(f'No taskId in response: {json.dumps(res)}')
-    return res['taskId']
-
-
-async def submit_task(prompt, aspect_ratio, context=''):
-    async def _do():
-        task_id = await asyncio.to_thread(_submit_task_sync, prompt, aspect_ratio)
-        print(f'{context}Task submitted: {task_id}')
-        return task_id
-    return await with_retry(_do, max_retries=SUBMIT_MAX_RETRIES, context=context)
-
-
-# --- Step 2: Poll for result ---
-async def poll_result(task_id, context=''):
-    poll_errors = 0
+def wait_for_completion(prompt_id, timeout=TIMEOUT_SECONDS):
+    start_time = time.time()
+    last_status = None
 
     while True:
+        elapsed = time.time() - start_time
+        if elapsed > timeout:
+            raise TimeoutError(f"生成超时 (>{timeout}秒)")
+
         try:
-            res = await asyncio.to_thread(
-                request_sync, 'POST', QUERY_PATH, {'taskId': task_id}
-            )
-            # Only consecutive poll errors count toward the retry limit.
-            poll_errors = 0
-            status = res.get('status')
+            with urllib.request.urlopen(
+                f"http://{COMFYUI_SERVER}/history/{prompt_id}", timeout=10
+            ) as response:
+                history = json.loads(response.read().decode("utf-8"))
+                if prompt_id in history:
+                    return history[prompt_id]
 
-            if status == 'SUCCESS':
-                results = res.get('results')
-                if not results or len(results) == 0 or not results[0].get('url'):
-                    raise RetryableError(f'SUCCESS but no image URL: {json.dumps(res)}')
-                return results[0]
+                if int(elapsed) % 5 == 0 and int(elapsed) != last_status:
+                    last_status = int(elapsed)
+                    log(f"等待中... {int(elapsed)}秒", "PROGRESS")
 
-            if status == 'FAILED':
-                # Signal caller to re-submit; retry count is managed by generate_single
-                return {'_failed': True, 'res': res}
-
-            # QUEUED or RUNNING
-            print(f'{context}Status: {status}. Polling in {POLL_INTERVAL_S}s...')
-            await asyncio.sleep(POLL_INTERVAL_S)
-
-        except FatalError:
-            raise
-        except RetryableError as e:
-            poll_errors += 1
-            if poll_errors > POLL_MAX_RETRIES:
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                pass
+            else:
                 raise
-            delay = calc_backoff(poll_errors, is_rate_limit=e.is_rate_limit)
-            print(f'{context}Poll error (retry {poll_errors}/{POLL_MAX_RETRIES}): {e}. Waiting {delay:.1f}s...')
-            await asyncio.sleep(delay)
+        except Exception as e:
+            log(f"检查状态出错: {e}", "WARN")
+
+        time.sleep(CHECK_INTERVAL)
 
 
-# --- Step 3: Download image ---
-def download_file(url, dest_path):
-    """Download file with redirect support"""
-    import shutil
-    from urllib.request import urlopen
-
-    with urlopen(url) as resp:
-        if resp.status >= 300 and resp.status < 400:
-            location = resp.headers.get('Location')
-            if location:
-                return download_file(location, dest_path)
-        if resp.status != 200:
-            raise RuntimeError(f'Download failed with status {resp.status}')
-        with open(dest_path, 'wb') as f:
-            shutil.copyfileobj(resp, f)
-    return dest_path
-
-
-# --- Generate single image ---
-async def generate_single(prompt, aspect_ratio, output_dir, index, total):
-    tag = f'[{index + 1}/{total}] ' if total > 1 else ''
-
-    submit_retries = 0
-    while submit_retries <= POLL_MAX_RETRIES:
-        task_id = await submit_task(prompt, aspect_ratio, context=tag)
-        result = await poll_result(task_id, context=tag)
-
-        if result.get('_failed'):
-            submit_retries += 1
-            if submit_retries > POLL_MAX_RETRIES:
-                raise RetryableError(f'{tag}Max retries exceeded for task submission.')
-            delay = calc_backoff(submit_retries)
-            print(f'{tag}Re-submitting task (attempt {submit_retries}/{POLL_MAX_RETRIES}) in {delay:.1f}s...')
-            await asyncio.sleep(delay)
-            continue
-        break
-
-    # Download with retry
-    ext = result.get('outputType', 'png')
-    timestamp = int(time.time() * 1000)
-    suffix = f'_{str(index + 1).zfill(len(str(total)))}' if total > 1 else ''
-    filename = f'banana2_{timestamp}{suffix}.{ext}'
-    filepath = str(Path(output_dir) / filename)
-
-    async def _download():
-        print(f'{tag}Downloading image to {filepath}...')
-        await asyncio.to_thread(download_file, result['url'], filepath)
-        print(f'{tag}Image saved: {filepath}')
-        return filepath
-
-    return await with_retry(_download, max_retries=MAX_RETRIES, context=tag)
-
-
-# --- Batch runner with concurrency control + final retry for failures ---
-async def run_batch(tasks, concurrency):
-    semaphore = asyncio.Semaphore(concurrency)
-    results = [None] * len(tasks)
-
-    async def worker(i, task):
-        async with semaphore:
-            try:
-                results[i] = await generate_single(
-                    task['prompt'], task['aspectRatio'],
-                    task['outputDir'], task['index'], task['total']
+def get_images_from_history(history):
+    images = []
+    outputs = history.get("outputs", {})
+    for node_id, node_output in outputs.items():
+        if "images" in node_output:
+            for img in node_output["images"]:
+                images.append(
+                    {
+                        "filename": img["filename"],
+                        "subfolder": img.get("subfolder", ""),
+                        "type": img.get("type", "output"),
+                    }
                 )
+    return images
+
+
+def download_image(img_info, save_path):
+    params = urllib.parse.urlencode(img_info)
+    url = f"http://{COMFYUI_SERVER}/view?{params}"
+    with urllib.request.urlopen(url, timeout=60) as response:
+        with open(save_path, "wb") as f:
+            f.write(response.read())
+    return save_path
+
+
+def find_and_update_workflow(workflow_template, positive_prompt, seed):
+    workflow = json.loads(json.dumps(workflow_template))
+
+    found_prompt = False
+    found_seed = False
+
+    for node_id, node in workflow.items():
+        class_type = node.get("class_type", "").lower()
+        inputs = node.get("inputs", {})
+
+        if "clip" in class_type and "textencode" in class_type:
+            if "text" in inputs:
+                inputs["text"] = positive_prompt
+                found_prompt = True
+
+        if class_type in ["ksampler", "randomnoise"]:
+            for key in ["seed", "noise_seed"]:
+                if key in inputs:
+                    inputs[key] = seed
+                    found_seed = True
+                    break
+
+    if not found_prompt:
+        log("警告: 未找到提示词节点", "WARN")
+    if not found_seed:
+        log("警告: 未找到种子节点", "WARN")
+
+    return workflow
+
+
+def generate_single(index, total, workflow_template, prompt, output_dir, aspect_ratio="16:9"):
+    tag = f"[{index}/{total}] " if total > 1 else ""
+
+    log(f"{tag}生成图片...")
+    log(f"{tag}提示词: {prompt[:80]}..." if len(prompt) > 80 else f"{tag}提示词: {prompt}")
+
+    seed = random.randint(1, 999999999)
+    log(f"{tag}种子: {seed}")
+
+    workflow = find_and_update_workflow(workflow_template, prompt, seed)
+
+    log(f"{tag}发送请求...")
+    try:
+        response = send_prompt(workflow)
+    except Exception as e:
+        raise RetryableError(f"{tag}发送请求失败: {e}")
+
+    prompt_id = response.get("prompt_id")
+    if not prompt_id:
+        raise RetryableError(f"{tag}未获取到任务ID")
+
+    log(f"{tag}任务ID: {prompt_id}")
+
+    log(f"{tag}等待生成完成 (超时: {TIMEOUT_SECONDS}秒)...")
+    try:
+        history = wait_for_completion(prompt_id)
+    except TimeoutError as e:
+        raise RetryableError(f"{tag}{e}")
+
+    images = get_images_from_history(history)
+    if not images:
+        raise RetryableError(f"{tag}生成完成但未找到图片")
+
+    log(f"{tag}找到 {len(images)} 张图片", "OK")
+
+    saved_paths = []
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    largest_img = None
+    largest_size = 0
+
+    for img_info in images:
+        params = urllib.parse.urlencode(img_info)
+        url = f"http://{COMFYUI_SERVER}/view?{params}"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                img_data = response.read()
+                img_size = len(img_data)
+                if img_size > largest_size:
+                    largest_size = img_size
+                    largest_img = {"info": img_info, "data": img_data}
+        except Exception as e:
+            log(f"{tag}下载图片失败: {e}", "WARN")
+            continue
+
+    if largest_img:
+        filename = f"comfyui_{index:04d}_{timestamp}_seed{seed}.png"
+        save_path = os.path.join(output_dir, filename)
+        with open(save_path, "wb") as f:
+            f.write(largest_img["data"])
+        size_mb = largest_size / 1024 / 1024
+        log(f"{tag}已保存: {filename} ({size_mb:.2f} MB)", "OK")
+        saved_paths.append(save_path)
+    else:
+        img_info = images[0]
+        filename = f"comfyui_{index:04d}_{timestamp}_seed{seed}.png"
+        save_path = os.path.join(output_dir, filename)
+        download_image(img_info, save_path)
+        log(f"{tag}已保存: {filename}", "OK")
+        saved_paths.append(save_path)
+
+    return saved_paths
+
+
+def run_batch(prompts, output_dir, aspect_ratio="16:9"):
+    print("\n" + "=" * 60)
+    log("ComfyUI 图片生成器")
+    print("=" * 60)
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    print(f"\n配置:")
+    print(f"  服务器: {COMFYUI_SERVER}")
+    print(f"  工作流: {WORKFLOW_JSON}")
+    print(f"  输出目录: {output_dir}")
+    print(f"  生成数量: {len(prompts)}")
+    print("=" * 60 + "\n")
+
+    workflow_template = load_workflow()
+    log("工作流加载成功", "OK")
+
+    all_results = []
+    success_count = 0
+    failed_count = 0
+    start_time = time.time()
+
+    for i, prompt in enumerate(prompts):
+        full_prompt = whiteboard_prompt_template + prompt if whiteboard_prompt_template else prompt
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                results = generate_single(
+                    i + 1, len(prompts), workflow_template, full_prompt, output_dir, aspect_ratio
+                )
+                all_results.extend(results)
+                success_count += 1
+                break
             except Exception as e:
-                results[i] = {'error': str(e), 'task': task}
+                log(f"[{i + 1}/{len(prompts)}] 生成失败 (尝试 {attempt}/{MAX_RETRIES}): {e}", "ERROR")
+                if attempt == MAX_RETRIES:
+                    failed_count += 1
+                    traceback.print_exc()
+                else:
+                    delay = 3 * (2 ** (attempt - 1))
+                    log(f"等待 {delay:.1f} 秒后重试...")
+                    time.sleep(delay)
 
-    await asyncio.gather(*(worker(i, t) for i, t in enumerate(tasks)))
+        if i < len(prompts) - 1:
+            time.sleep(0.5)
 
-    # Final retry pass: retry all failed tasks (with same concurrency limit)
-    failed_indices = [i for i, r in enumerate(results) if isinstance(r, dict) and r.get('error')]
-    if failed_indices:
-        print(f'\nRetrying {len(failed_indices)} failed tasks...')
-        await asyncio.sleep(RETRY_BASE_DELAY_S)
+    total_time = time.time() - start_time
+    print("\n" + "=" * 60)
+    log("批量生成完成!")
+    print(f"  成功: {success_count}/{len(prompts)}")
+    print(f"  失败: {failed_count}/{len(prompts)}")
+    print(f"  总耗时: {total_time:.1f} 秒")
+    print(f"  平均: {total_time / max(success_count, 1):.1f} 秒/张")
+    print(f"  保存位置: {output_dir}")
+    print("=" * 60 + "\n")
 
-        async def retry_worker(i):
-            async with semaphore:
-                task = results[i]['task']
-                try:
-                    results[i] = await generate_single(
-                        task['prompt'], task['aspectRatio'],
-                        task['outputDir'], task['index'], task['total']
-                    )
-                except Exception as e:
-                    results[i] = {'error': str(e)}
-
-        await asyncio.gather(*(retry_worker(i) for i in failed_indices))
-
-    return results
+    return all_results
 
 
-# --- Main ---
-async def main():
-    load_env()
+def main():
     args = sys.argv[1:]
-    prompt_arg = args[0] if len(args) > 0 else ''
-    aspect_ratio = args[1] if len(args) > 1 else '16:9'
+    if len(args) < 1:
+        print("用法:")
+        print("  python generate-image.py \"<prompt>\" [aspect_ratio] [output_dir]")
+        print("  python generate-image.py '[\"prompt1\", \"prompt2\"]' [aspect_ratio] [output_dir]  # 批量模式")
+        sys.exit(1)
+
+    prompt_arg = args[0]
+    aspect_ratio = args[1] if len(args) > 1 else "16:9"
     output_dir = args[2] if len(args) > 2 else os.getcwd()
 
     if not prompt_arg.strip():
-        print('Error: prompt is required and cannot be empty.')
+        log("错误: prompt 不能为空", "ERROR")
         sys.exit(1)
 
-    # Ensure output directory exists
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    # Detect batch mode: prompt is a JSON-encoded array of strings
     prompts = None
     try:
         parsed = json.loads(prompt_arg)
@@ -313,37 +331,22 @@ async def main():
     if not prompts:
         prompts = [prompt_arg]
 
-    total = len(prompts)
-    is_batch = total > 1
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    if is_batch:
-        print(f'Batch mode: generating {total} images (concurrency: {BATCH_CONCURRENCY})...')
+    try:
+        results = run_batch(prompts, output_dir, aspect_ratio)
+    except FileNotFoundError:
+        sys.exit(1)
+    except Exception as e:
+        log(f"错误: {e}", "ERROR")
+        traceback.print_exc()
+        sys.exit(1)
 
-    tasks = [
-        {
-            'prompt': whiteboard_prompt_template + prompt,
-            'aspectRatio': aspect_ratio,
-            'outputDir': output_dir,
-            'index': i,
-            'total': total,
-        }
-        for i, prompt in enumerate(prompts)
-    ]
+    succeeded = [r for r in results if os.path.exists(r)]
+    failed = len(prompts) - len(succeeded)
 
-    results = await run_batch(tasks, BATCH_CONCURRENCY)
-
-    # Summary
-    succeeded = [r for r in results if isinstance(r, str)]
-    failed = [r for r in results if isinstance(r, dict) and r.get('error')]
-    if is_batch:
-        print(f'\nBatch complete: {len(succeeded)} succeeded, {len(failed)} failed.')
-    if failed:
-        for f in failed:
-            print(f"  Error: {f['error']}")
-
-    # Output results as JSON for programmatic use
-    print(f'\n__RESULTS__{json.dumps(results)}')
+    print(f"\n__RESULTS__{json.dumps(results)}")
 
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    main()
