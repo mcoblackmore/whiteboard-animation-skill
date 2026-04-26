@@ -4,7 +4,6 @@ Whiteboard Video Workflow - 环境预检脚本
 
 一次性检查所有依赖：
   1. Python 虚拟环境 + opencv/numpy/av（调用 setup_env.py）
-  2. RUNNINGHUB_API_KEY
 
 用法：
   python3 check_env.py                # 检测并自动安装缺失依赖
@@ -25,7 +24,6 @@ SKILL_DIR = SCRIPT_DIR.parent
 SKILLS_ROOT = SKILL_DIR.parent
 
 ANIMATION_SKILL = SKILLS_ROOT / "whiteboard-animation"
-IMAGE_GEN_SKILL = SKILL_DIR  # .env 已迁入本 skill 根目录
 
 
 def check_python_venv(check_only):
@@ -73,40 +71,16 @@ def check_python_venv(check_only):
     return {"ok": False, "error": "Python 虚拟环境未就绪，缺少依赖"}
 
 
-def check_api_key():
-    """检查 RUNNINGHUB_API_KEY"""
-    env_file = SKILL_DIR / ".env"
-    if not env_file.exists():
-        return {"ok": False, "error": f".env 文件不存在: {env_file}，请创建并设置 RUNNINGHUB_API_KEY"}
-
-    content = env_file.read_text(encoding="utf-8")
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("RUNNINGHUB_API_KEY="):
-            value = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-            if value:
-                return {"ok": True}
-            break
-
-    return {"ok": False, "error": f"RUNNINGHUB_API_KEY 未设置，请在 {env_file} 中设置"}
-
-
 def main():
     check_only = "--check-only" in sys.argv
 
     results = {}
     all_ok = True
 
-    # 1. Python 虚拟环境
+    # Python 虚拟环境
     print("[检查] Python 虚拟环境...")
     results["python"] = check_python_venv(check_only)
     if not results["python"]["ok"]:
-        all_ok = False
-
-    # 2. API Key
-    print("[检查] RUNNINGHUB_API_KEY...")
-    results["apiKey"] = check_api_key()
-    if not results["apiKey"]["ok"]:
         all_ok = False
 
     # 输出结果
